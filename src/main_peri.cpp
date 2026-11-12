@@ -21,6 +21,19 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 
+class ServerCallbacks : public NimBLEServerCallbacks {
+    void onConnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo) override {
+        Serial.printf("Client connected: %s\n", connInfo.getAddress().toString().c_str());
+    }
+
+    void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
+        Serial.printf("Client disconnected (reason: %d). Restarting advertising...\n", reason);
+        NimBLEDevice::getAdvertising()->start(0);
+    }
+};
+
+static ServerCallbacks serverCallbacks;
+
 void setup() {
     Serial.begin(115200);
     delay(4000);
@@ -40,6 +53,9 @@ void setup() {
 
     pNonSecureCharacteristic->setValue("Hello Non Secure BLE");
     pSecureCharacteristic->setValue("Hello Secure BLE");
+    
+    // Add callbacks to server
+    pServer->setCallbacks(&serverCallbacks);
 
     // Create a legacy-compatible advertisement instance
     NimBLEExtAdvertisement extAdv;
