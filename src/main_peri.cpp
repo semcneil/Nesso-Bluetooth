@@ -5,77 +5,57 @@
   2026 August 17
 */
 
+
+/**
+ * NimBLE_Secure_Server Demo:
+ *
+ * This example demonstrates the secure passkey protected conenction and communication between an esp32 server and an
+ * esp32 client. Please note that esp32 stores auth info in nvs memory. After a successful connection it is possible
+ * that a passkey change will be ineffective. To avoid this clear the memory of the esp32's between security testings.
+ * esptool.py is capable of this, example: esptool.py --port /dev/ttyUSB0 erase_flash.
+ *
+ *  Created: on Jan 08 2021
+ *      Author: mblasee
+ */
+
 #include <Arduino.h>
-#include <Arduino_Nesso_N1.h>
-#include "time.h"
-#include <esp_crt_bundle.h>
-#include <esp_mac.h>
-#include <ArduinoJson.h>
-
-#include "secrets.h"
-
 #include <NimBLEDevice.h>
-
-#define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
-#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
-
-class RandomDataCallbacks : public NimBLECharacteristicCallbacks {
-    void onRead(NimBLECharacteristic* pCharacteristic, NimBLEConnInfo& connInfo) override {
-        uint32_t randomVal = random(0, 100000);
-        pCharacteristic->setValue((uint8_t*)&randomVal, sizeof(randomVal));
-        
-        Serial.printf("Client (%s) read data. Sent random value: %u\n", 
-                      connInfo.getAddress().toString().c_str(), 
-                      randomVal);
-    }
-};
 
 void setup() {
     Serial.begin(115200);
-    delay(3000);
-    while (!Serial) { delay(10); }
+    delay(4000);
+    Serial.println("Starting NimBLE Server");
+    NimBLEDevice::init("NimBLE");
+    NimBLEDevice::setPower(3); /** +3db */
 
-    Serial.println("Starting NimBLE BLE5 Peripheral...");
-    randomSeed(analogRead(0));
+    NimBLEDevice::setSecurityAuth(true, true, false); /** bonding, MITM, don't need BLE secure connections as we are using passkey pairing */
+    NimBLEDevice::setSecurityPasskey(123456);
+    NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY); /** Display only passkey */
+    NimBLEServer*         pServer                  = NimBLEDevice::createServer();
+    NimBLEService*        pService                 = pServer->createService("ABCD");
+    NimBLECharacteristic* pNonSecureCharacteristic = pService->createCharacteristic("1234", NIMBLE_PROPERTY::READ);
+    NimBLECharacteristic* pSecureCharacteristic =
+        pService->createCharacteristic("1235",
+                                       NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::READ_ENC | NIMBLE_PROPERTY::READ_AUTHEN);
 
-    // 1. Initialize NimBLE Device
-    NimBLEDevice::init("drseth");
+    pNonSecureCharacteristic->setValue("Hello Non Secure BLE");
+    pSecureCharacteristic->setValue("Hello Secure BLE");
 
-    NimBLEAddress macAddress = NimBLEDevice::getAddress();
-    Serial.printf("Device BLE MAC Address: %s\n", macAddress.toString().c_str());
+    // Create a legacy-compatible advertisement instance
+    NimBLEExtAdvertisement extAdv;
+    extAdv.setLegacyAdvertising(true); // Broadcasts standard BLE 4.x packets
+    extAdv.setScannable(true);
+    extAdv.setConnectable(true);
+    extAdv.setName("NimBLE-Secure-Server");
+    extAdv.setCompleteServices(NimBLEUUID("ABCD"));
 
-    // 2. Create Server & Service
-    NimBLEServer* pServer = NimBLEDevice::createServer();
-    NimBLEService* pService = pServer->createService(SERVICE_UUID);
-
-    // 3. Create Characteristic with READ property
-    NimBLECharacteristic* pCharacteristic = pService->createCharacteristic(
-        CHARACTERISTIC_UUID,
-        NIMBLE_PROPERTY::READ
-    );
-    pCharacteristic->setCallbacks(new RandomDataCallbacks());
-
-    uint32_t initialVal = 0;
-    pCharacteristic->setValue((uint8_t*)&initialVal, sizeof(initialVal));
-
-    // 4. Start Server
-    pServer->start();
-
-    // 5. Build Advertising Data using NimBLEExtAdvertisement
-    NimBLEExtAdvertisement advData;
-    advData.setName("drseth");
-    advData.setCompleteServices(NimBLEUUID(SERVICE_UUID));
-
-    // 6. Register payload to advertising set 0
+    // Register and start instance 0
     NimBLEExtAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
-    pAdvertising->setInstanceData(0, advData);
-
-    // 7. Start advertising set 0
-    pAdvertising->start(0);
-    
-    Serial.println("BLE Advertising started. Waiting for queries/reads...");
+    if (pAdvertising->setInstanceData(0, extAdv)) {
+        pAdvertising->start(0);
+    }
 }
 
 void loop() {
-    delay(1000);
+    delay(3000);
 }
