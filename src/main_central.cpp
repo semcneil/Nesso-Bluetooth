@@ -18,7 +18,7 @@
 
 // Passkey & Timing Constants
 constexpr uint32_t      SERVER_PASSKEY    = 123456;
-constexpr unsigned long BTN_DEBOUNCE_MS   = 20;
+constexpr unsigned long BTN_DEBOUNCE_MS   = 15;
 constexpr unsigned long LOCAL_BAT_POLL_MS = 3000;
 
 NessoDisplay display;
@@ -45,18 +45,17 @@ uint8_t       localBatPct        = 0;
 float         localBatVolts      = 0.0f;
 bool          localCharging      = false;
 
-// Remote server telemetry for display (shared between BLE callbacks & loop)
-volatile bool displayDirty       = false;
+// Granular UI dirty flags (avoids full-screen redraws on button presses)
+volatile bool fullRedrawDirty    = false;
+volatile bool buttonsDirty       = false;
+volatile bool batteryDirty       = false;
+
 uint8_t       serverBatPct       = 0;
 float         serverBatVolts     = 0.0f;
 bool          serverCharging     = false;
 uint8_t       serverKey1State    = 0;
 char          serverAddrStr[24]  = "None";
 
-// Forward declarations
-void renderStatusScreen();
-
-// Helper: Reads active-low buttons on Arduino Nesso N1 (1 = pressed, 0 = released)
 uint8_t readKey1() { return (digitalRead(KEY1) == LOW) ? 1 : 0; }
 uint8_t readKey2() { return (digitalRead(KEY2) == LOW) ? 1 : 0; }
 
@@ -70,38 +69,29 @@ void updateLocalBattery() {
     localBatPct   = percentage;
     localBatVolts = voltageMv / 1000.0f;
     localCharging = (status == NessoBattery::CHARGING);
-    displayDirty  = true;
+    batteryDirty  = true;
 }
 
-// Notification callback for subscribed characteristics
 void notifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic,
                     uint8_t* pData, size_t length, bool isNotify) {
     NimBLEUUID uuid = pRemoteCharacteristic->getUUID();
 
     if (uuid.equals(NimBLEUUID(BUTTON_CHAR_UUID)) && length >= 1) {
         serverKey1State = pData[0];
-        displayDirty    = true;
-        Serial.printf("[NOTIFY] Server KEY1 -> %s (%u)\n", serverKey1State ? "PRESSED" : "RELEASED", serverKey1State);
-    } 
-    else if (uuid.equals(NimBLEUUID(RX_DATA_CHAR_UUID)) && length >= 1) {
-        Serial.printf("[NOTIFY] Receive Data (0x1237) Echo -> 0x%02X (%u)\n", pData[0], pData[0]);
+        buttonsDirty    = true;
     } 
     else if (uuid.equals(NimBLEUUID(BATTERY_LEVEL_CHAR_UUID)) && length >= 1) {
         serverBatPct = pData[0];
-        displayDirty = true;
-        Serial.printf("[NOTIFY] Server Battery Level -> %u%%\n", serverBatPct);
+        batteryDirty = true;
     } 
     else if (uuid.equals(NimBLEUUID(BATTERY_POWER_STATE_CHAR_UUID)) && length >= 1) {
-        uint8_t state  = pData[0];
-        serverCharging = ((state >> 4) & 0x03) == 0x03;
-        displayDirty   = true;
-        Serial.printf("[NOTIFY] Server Power State -> 0x%02X (%s)\n", state, serverCharging ? "CHARGING" : "ON BATTERY");
+        serverCharging = ((pData[0] >> 4) & 0x03) == 0x03;
+        batteryDirty   = true;
     } 
     else if (uuid.equals(NimBLEUUID(BATTERY_VOLTAGE_CHAR_UUID)) && length >= 2) {
         uint16_t voltageMv = pData[0] | (pData[1] << 8);
         serverBatVolts     = voltageMv / 1000.0f;
-        displayDirty       = true;
-        Serial.printf("[NOTIFY] Server Battery Voltage -> %.3f V (%u mV)\n", serverBatVolts, voltageMv);
+        batteryDirty       = true;
     }
 }
 
@@ -112,34 +102,28 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         strncpy(serverAddrStr, addr.c_str(), sizeof(serverAddrStr) - 1);
         serverAddrStr[sizeof(serverAddrStr) - 1] = '\0';
 
-        Serial.printf("Connected to server: %s\n", serverAddrStr);
-        isConnected  = true;
-        isScanning   = false;
-        displayDirty = true;
+        isConnected     = true;
+        isScanning      = false;
+        fullRedrawDirty = true;
     }
 
     void onDisconnect(NimBLEClient* client, int reason) override {
-        Serial.printf("Disconnected (reason: %d). Press KEY2 to scan/reconnect.\n", reason);
         isConnected     = false;
         isScanning      = false;
         pRemoteRxChar   = nullptr;
         serverKey1State = 0;
         strncpy(serverAddrStr, "None", sizeof(serverAddrStr));
-        displayDirty    = true;
+        fullRedrawDirty = true;
     }
 
     void onPassKeyEntry(NimBLEConnInfo& connInfo) override {
-        Serial.printf("Supplying passkey: %lu\n", SERVER_PASSKEY);
         NimBLEDevice::injectPassKey(connInfo, SERVER_PASSKEY);
     }
 
     void onAuthenticationComplete(NimBLEConnInfo& connInfo) override {
         if (!connInfo.isEncrypted()) {
-            Serial.println("Authentication failed!");
             NimBLEDevice::getClientByHandle(connInfo.getConnHandle())->disconnect();
-            return;
         }
-        Serial.println("Pairing & encryption succeeded!");
     }
 };
 
@@ -147,7 +131,6 @@ class ScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
         if (advertisedDevice->getName() == TARGET_DEVICE_NAME ||
             advertisedDevice->isAdvertisingService(NimBLEUUID(CUSTOM_SERVICE_UUID))) {
-            Serial.printf("Found target server: %s\n", advertisedDevice->toString().c_str());
             NimBLEDevice::getScan()->stop();
             isScanning = false;
 
@@ -155,9 +138,9 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                 delete advDevice;
                 advDevice = nullptr;
             }
-            advDevice    = new NimBLEAdvertisedDevice(*advertisedDevice);
-            doConnect    = true;
-            displayDirty = true;
+            advDevice       = new NimBLEAdvertisedDevice(*advertisedDevice);
+            doConnect       = true;
+            fullRedrawDirty = true;
         }
     }
 };
@@ -167,7 +150,6 @@ static ScanCallbacks   scanCallbacks;
 
 void renderBootScreen() {
     display.fillScreen(TFT_BLACK);
-
     display.fillRect(0, 0, display.width(), 28, TFT_NAVY);
     display.setTextColor(TFT_WHITE, TFT_NAVY);
     display.setTextSize(1);
@@ -178,52 +160,72 @@ void renderBootScreen() {
     display.setTextSize(2);
     display.setCursor(20, (display.height() / 2) - 12);
     display.print("Booting...");
-
-    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.setTextSize(1);
-    display.setCursor(20, (display.height() / 2) + 16);
-    display.print("Initializing fuel gauge & scanner");
 }
 
-void renderStatusScreen() {
-    display.fillScreen(TFT_BLACK);
-
-    // 1. Top Header Banner (Green = CONNECTED, Blue = SCANNING, Dark Grey = IDLE)
-    uint16_t bannerColor = TFT_DARKGREY;
-    uint16_t textColor   = TFT_WHITE;
-    const char* stateLabel = "IDLE";
-
-    if (isConnected) {
-        bannerColor = TFT_DARKGREEN;
-        textColor   = TFT_WHITE;
-        stateLabel  = "CONNECTED";
-    } else if (isScanning || doConnect) {
-        bannerColor = TFT_BLUE;
-        textColor   = TFT_WHITE;
-        stateLabel  = "SCANNING";
-    }
-
-    display.fillRect(0, 0, display.width(), 32, bannerColor);
-    display.setTextColor(textColor, bannerColor);
+// Fast partial update for button states only (< 1 ms)
+void updateButtonsRegion() {
     display.setTextSize(2);
-    display.setCursor(8, 8);
-    display.print(stateLabel);
+    display.setTextColor(lastKey1State ? TFT_GREENYELLOW : TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(8, 78);
+    display.print(lastKey1State ? "PRESSED " : "RELEASED");
 
-    // Server Battery Telemetry on right side of header when connected
+    if (!isConnected) {
+        display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+        display.setCursor(128, 78);
+        display.print("---     ");
+    } else {
+        display.setTextColor(serverKey1State ? TFT_ORANGE : TFT_LIGHTGREY, TFT_BLACK);
+        display.setCursor(128, 78);
+        display.print(serverKey1State ? "PRESSED " : "RELEASED");
+    }
+}
+
+// Fast partial update for header & footer battery readouts
+void updateBatteryRegion() {
+    uint16_t bannerColor = isConnected ? TFT_DARKGREEN : ((isScanning || doConnect) ? TFT_BLUE : TFT_DARKGREY);
+    display.setTextColor(TFT_WHITE, bannerColor);
     display.setTextSize(1);
+
     if (isConnected) {
         const char* srvChgTag = serverCharging ? "CHG" : "BAT";
         display.setCursor(138, 6);
         display.printf("SRV:%3u%%[%s]", serverBatPct, srvChgTag);
-
         display.setCursor(138, 18);
-        display.printf("    %.2fV", serverBatVolts);
+        display.printf("    %.2fV  ", serverBatVolts);
     } else {
-        display.setCursor(142, 12);
-        display.print("KEY2: Toggle");
+        display.setCursor(142, 6);
+        display.print("CENTRAL    ");
+        display.setCursor(142, 18);
+        display.print("KEY2:Toggle");
     }
 
-    // 2. Server Address / Status Line
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(8, 119);
+    const char* locChgTag = localCharging ? "CHG" : "BAT";
+    display.printf("[CENTRAL] BAT: %3u%% (%.2fV) [%s] ", localBatPct, localBatVolts, locChgTag);
+}
+
+// Full layout redraw (only called on state transitions)
+void renderFullScreen() {
+    display.fillScreen(TFT_BLACK);
+
+    uint16_t bannerColor = TFT_DARKGREY;
+    const char* stateLabel = "IDLE";
+
+    if (isConnected) {
+        bannerColor = TFT_DARKGREEN;
+        stateLabel  = "CONNECTED";
+    } else if (isScanning || doConnect) {
+        bannerColor = TFT_BLUE;
+        stateLabel  = "SCANNING";
+    }
+
+    display.fillRect(0, 0, display.width(), 32, bannerColor);
+    display.setTextColor(TFT_WHITE, bannerColor);
+    display.setTextSize(2);
+    display.setCursor(8, 8);
+    display.print(stateLabel);
+
     display.setTextSize(1);
     display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.setCursor(8, 40);
@@ -241,52 +243,26 @@ void renderStatusScreen() {
 
     display.drawFastHLine(8, 54, display.width() - 16, TFT_DARKGREY);
 
-    // 3. Two-Column Button Status Section (Local KEY1 TX vs Remote Server KEY1 RX)
-    // Left Column: Local KEY1 (Sent to 0x1237)
     display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.setCursor(8, 62);
     display.print("LOCAL KEY1 (TX)");
 
-    display.setTextSize(2);
-    display.setTextColor(lastKey1State ? TFT_GREENYELLOW : TFT_LIGHTGREY, TFT_BLACK);
-    display.setCursor(8, 78);
-    display.print(lastKey1State ? "PRESSED" : "RELEASED");
-
-    // Vertical divider
     display.drawFastVLine(120, 60, 48, TFT_DARKGREY);
 
-    // Right Column: Server KEY1 (Received from 0x1236)
-    display.setTextSize(1);
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.setCursor(128, 62);
     display.print("SERVER KEY1 (RX)");
 
-    display.setTextSize(2);
-    if (!isConnected) {
-        display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        display.setCursor(128, 78);
-        display.print("---");
-    } else {
-        display.setTextColor(serverKey1State ? TFT_ORANGE : TFT_LIGHTGREY, TFT_BLACK);
-        display.setCursor(128, 78);
-        display.print(serverKey1State ? "PRESSED" : "RELEASED");
-    }
-
-    // 4. Footer Bar with Central's Own Battery Level & Voltage
     display.drawFastHLine(8, 112, display.width() - 16, TFT_DARKGREY);
-    display.setTextSize(1);
-    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-    display.setCursor(8, 119);
-    const char* locChgTag = localCharging ? "CHG" : "BAT";
-    display.printf("LOCAL BAT: %u%% (%.2fV) [%s]", localBatPct, localBatVolts, locChgTag);
+
+    updateButtonsRegion();
+    updateBatteryRegion();
 }
 
 void startScanning() {
     if (!isScanning && !isConnected) {
-        Serial.println("Scanning for NimBLE-Secure-Server...");
         NimBLEDevice::getScan()->start(0, false);
-        isScanning   = true;
-        displayDirty = true;
+        isScanning      = true;
+        fullRedrawDirty = true;
     }
 }
 
@@ -295,88 +271,61 @@ void stopAndDisconnect() {
     if (isScanning) {
         NimBLEDevice::getScan()->stop();
         isScanning = false;
-        Serial.println("Scanning stopped (IDLE).");
     }
     if (pClient != nullptr && pClient->isConnected()) {
-        Serial.println("Disconnecting from server...");
         pClient->disconnect();
     }
     isConnected     = false;
     pRemoteRxChar   = nullptr;
     serverKey1State = 0;
     strncpy(serverAddrStr, "None", sizeof(serverAddrStr));
-    displayDirty    = true;
+    fullRedrawDirty = true;
 }
 
 bool connectAndDiscover() {
     if (pClient == nullptr) {
         pClient = NimBLEDevice::createClient();
         pClient->setClientCallbacks(&clientCallbacks, false);
-        pClient->setConnectionParams(12, 12, 0, 150);
+        // Balanced 30ms - 45ms connection interval with 0 slave latency for snappy, reliable writes
+        pClient->setConnectionParams(24, 36, 0, 200);
         pClient->setConnectTimeout(5000);
     }
 
     if (!pClient->connect(advDevice)) {
-        Serial.println("Failed to connect.");
-        displayDirty = true;
         return false;
     }
 
-    // 1. Discover Custom Service ("ABCD")
     NimBLERemoteService* pCustomSvc = pClient->getService(CUSTOM_SERVICE_UUID);
     if (pCustomSvc) {
-        NimBLERemoteCharacteristic* pNonSec = pCustomSvc->getCharacteristic(NON_SECURE_CHAR_UUID);
-        if (pNonSec && pNonSec->canRead()) {
-            Serial.printf("[READ] 1234 (Non-Secure): %s\n", pNonSec->readValue().c_str());
-        }
-
         NimBLERemoteCharacteristic* pBtn = pCustomSvc->getCharacteristic(BUTTON_CHAR_UUID);
         if (pBtn) {
-            if (pBtn->canRead()) {
-                serverKey1State = pBtn->readValue<uint8_t>();
-                Serial.printf("[READ] 1236 (Initial Server KEY1): %u\n", serverKey1State);
-            }
-            if (pBtn->canNotify()) {
-                pBtn->subscribe(true, notifyCallback);
-            }
+            if (pBtn->canRead()) serverKey1State = pBtn->readValue<uint8_t>();
+            if (pBtn->canNotify()) pBtn->subscribe(true, notifyCallback);
         }
 
         pRemoteRxChar = pCustomSvc->getCharacteristic(RX_DATA_CHAR_UUID);
         if (pRemoteRxChar) {
-            if (pRemoteRxChar->canRead()) {
-                Serial.printf("[READ] 1237 (Initial RX): 0x%02X\n", pRemoteRxChar->readValue<uint8_t>());
-            }
-            if (pRemoteRxChar->canNotify()) {
-                pRemoteRxChar->subscribe(true, notifyCallback);
-            }
-            // Immediately sync current local KEY1 state upon connecting
+            // Subscribe only if needed; skipping echo notify reduces RF traffic
             uint8_t initialKey1 = readKey1();
-            if (pRemoteRxChar->canWrite()) {
+            if (pRemoteRxChar->canWriteNoResponse()) {
+                pRemoteRxChar->writeValue(&initialKey1, 1, false);
+            } else if (pRemoteRxChar->canWrite()) {
                 pRemoteRxChar->writeValue(&initialKey1, 1, true);
             }
         }
 
         NimBLERemoteCharacteristic* pSec = pCustomSvc->getCharacteristic(SECURE_CHAR_UUID);
-        if (pSec && pSec->canRead()) {
-            Serial.println("Reading secure characteristic 1235 (initiating passkey pairing)...");
-            if (pClient->secureConnection()) {
-                Serial.printf("[READ] 1235 (Secure): %s\n", pSec->readValue().c_str());
-            }
+        if (pSec && pSec->canRead() && pClient->secureConnection()) {
+            pSec->readValue();
         }
     }
 
-    // 2. Discover Standard Battery Service ("180F")
     NimBLERemoteService* pBatSvc = pClient->getService(BATTERY_SERVICE_UUID);
     if (pBatSvc) {
         NimBLERemoteCharacteristic* pBatLvl = pBatSvc->getCharacteristic(BATTERY_LEVEL_CHAR_UUID);
         if (pBatLvl) {
-            if (pBatLvl->canRead()) {
-                serverBatPct = pBatLvl->readValue<uint8_t>();
-                Serial.printf("[READ] Server Battery Level: %u%%\n", serverBatPct);
-            }
-            if (pBatLvl->canNotify()) {
-                pBatLvl->subscribe(true, notifyCallback);
-            }
+            if (pBatLvl->canRead()) serverBatPct = pBatLvl->readValue<uint8_t>();
+            if (pBatLvl->canNotify()) pBatLvl->subscribe(true, notifyCallback);
         }
 
         NimBLERemoteCharacteristic* pBatState = pBatSvc->getCharacteristic(BATTERY_POWER_STATE_CHAR_UUID);
@@ -384,54 +333,43 @@ bool connectAndDiscover() {
             if (pBatState->canRead()) {
                 uint8_t state  = pBatState->readValue<uint8_t>();
                 serverCharging = ((state >> 4) & 0x03) == 0x03;
-                Serial.printf("[READ] Server Power State: 0x%02X\n", state);
             }
-            if (pBatState->canNotify()) {
-                pBatState->subscribe(true, notifyCallback);
-            }
+            if (pBatState->canNotify()) pBatState->subscribe(true, notifyCallback);
         }
 
         NimBLERemoteCharacteristic* pBatVolt = pBatSvc->getCharacteristic(BATTERY_VOLTAGE_CHAR_UUID);
         if (pBatVolt) {
             if (pBatVolt->canRead()) {
-                uint16_t mv    = pBatVolt->readValue<uint16_t>();
-                serverBatVolts = mv / 1000.0f;
-                Serial.printf("[READ] Server Battery Voltage: %.3f V (%u mV)\n", serverBatVolts, mv);
+                serverBatVolts = pBatVolt->readValue<uint16_t>() / 1000.0f;
             }
-            if (pBatVolt->canNotify()) {
-                pBatVolt->subscribe(true, notifyCallback);
-            }
+            if (pBatVolt->canNotify()) pBatVolt->subscribe(true, notifyCallback);
         }
     }
 
-    displayDirty = true;
+    fullRedrawDirty = true;
     return true;
 }
 
 void setup() {
     Serial.begin(115200);
 
-    // Initialize display immediately and show Booting screen
     display.begin();
-    display.setRotation(1); // Landscape orientation (240x135)
+    display.setRotation(1);
     renderBootScreen();
 
-    delay(1500);
-    Serial.println("Starting NimBLE Central Client...");
+    delay(1000);
 
-    // Initialize local BQ27220 battery fuel gauge
     battery.begin();
     updateLocalBattery();
     lastLocalBatPollMs = millis();
 
-    // Initialize KEY1 and KEY2 buttons
     pinMode(KEY1, INPUT_PULLUP);
     pinMode(KEY2, INPUT_PULLUP);
     lastKey1State = readKey1();
     lastKey2State = readKey2();
 
     NimBLEDevice::init("NimBLE-Central");
-    NimBLEDevice::setPower(3);
+    NimBLEDevice::setPower(9); // +9 dBm for stronger, lower-retransmit RF link
 
     NimBLEDevice::setSecurityAuth(true, true, false);
     NimBLEDevice::setSecurityPasskey(SERVER_PASSKEY);
@@ -439,34 +377,39 @@ void setup() {
 
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setScanCallbacks(&scanCallbacks, false);
-    pScan->setInterval(100);
-    pScan->setWindow(99);
+    pScan->setInterval(80);
+    pScan->setWindow(40); // 50% duty cycle prevents radio starvation during connect
     pScan->setActiveScan(true);
 
-    // Start scanning on boot (KEY2 toggles off/on anytime)
     startScanning();
 
-    // Switch from Booting screen to active Status screen
-    displayDirty = false;
-    renderStatusScreen();
+    fullRedrawDirty = false;
+    buttonsDirty    = false;
+    batteryDirty    = false;
+    renderFullScreen();
 }
 
 void loop() {
     unsigned long now = millis();
 
-    // 1. Refresh display safely on the main loop task
-    if (displayDirty) {
-        displayDirty = false;
-        renderStatusScreen();
+    // 1. Handle KEY1 FIRST for immediate low-latency transmission
+    uint8_t currentKey1 = readKey1();
+    if (currentKey1 != lastKey1State && (now - lastKey1Change) >= BTN_DEBOUNCE_MS) {
+        lastKey1Change = now;
+        lastKey1State  = currentKey1;
+        buttonsDirty   = true;
+
+        if (isConnected && pRemoteRxChar != nullptr) {
+            // Write Without Response (false) avoids blocking for an ATT ACK round-trip
+            if (pRemoteRxChar->canWriteNoResponse()) {
+                pRemoteRxChar->writeValue(&lastKey1State, 1, false);
+            } else {
+                pRemoteRxChar->writeValue(&lastKey1State, 1, true);
+            }
+        }
     }
 
-    // 2. Periodically poll the central unit's own battery gauge
-    if ((now - lastLocalBatPollMs) >= LOCAL_BAT_POLL_MS) {
-        lastLocalBatPollMs = now;
-        updateLocalBattery();
-    }
-
-    // 3. Handle KEY2 Press: Toggle Scan/Connect vs. Disconnect/Idle
+    // 2. Handle KEY2 Press: Toggle Scan/Connect vs. Disconnect/Idle
     uint8_t currentKey2 = readKey2();
     if (currentKey2 != lastKey2State && (now - lastKey2Change) >= BTN_DEBOUNCE_MS) {
         lastKey2Change = now;
@@ -481,31 +424,36 @@ void loop() {
         }
     }
 
-    // 4. Complete pending connection triggered by scan result
+    // 3. Complete pending connection
     if (doConnect) {
         doConnect = false;
-        if (connectAndDiscover()) {
-            Serial.println("Discovery & subscriptions complete!");
-        } else {
-            Serial.println("Connection failed. Press KEY2 to retry.");
-            displayDirty = true;
+        if (!connectAndDiscover()) {
+            fullRedrawDirty = true;
         }
     }
 
-    // 5. Handle KEY1 State Change: Write 1 (pressed) or 0 (released) to 0x1237
-    uint8_t currentKey1 = readKey1();
-    if (currentKey1 != lastKey1State && (now - lastKey1Change) >= BTN_DEBOUNCE_MS) {
-        lastKey1Change = now;
-        lastKey1State  = currentKey1;
-        displayDirty   = true;
-
-        if (isConnected && pRemoteRxChar != nullptr && pRemoteRxChar->canWrite()) {
-            pRemoteRxChar->writeValue(&lastKey1State, 1, true);
-            Serial.printf("[WRITE] KEY1 -> 0x1237 = %u\n", lastKey1State);
-        } else {
-            Serial.printf("KEY1 -> %u (not connected)\n", lastKey1State);
+    // 4. Granular Display Updates (never blocks BLE writes)
+    if (fullRedrawDirty) {
+        fullRedrawDirty = false;
+        buttonsDirty    = false;
+        batteryDirty    = false;
+        renderFullScreen();
+    } else {
+        if (buttonsDirty) {
+            buttonsDirty = false;
+            updateButtonsRegion();
+        }
+        if (batteryDirty) {
+            batteryDirty = false;
+            updateBatteryRegion();
         }
     }
 
-    delay(5);
+    // 5. Periodic local battery poll
+    if ((now - lastLocalBatPollMs) >= LOCAL_BAT_POLL_MS) {
+        lastLocalBatPollMs = now;
+        updateLocalBattery();
+    }
+
+    delay(1);
 }
