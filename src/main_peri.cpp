@@ -288,7 +288,6 @@ void setup() {
     pNonSecureCharacteristic->setValue("Hello Non Secure BLE");
     pSecureCharacteristic->setValue("Hello Secure BLE");
     pButtonChar->setValue(&lastKey1State, 1);
-    pService->start();
 
     NimBLEService* pBatteryService = pServer->createService(BATTERY_SERVICE_UUID);
     pBatteryLevelChar   = pBatteryService->createCharacteristic(BATTERY_LEVEL_CHAR_UUID, NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
@@ -300,8 +299,6 @@ void setup() {
     pFormat2904->setExponent(-3);
     pFormat2904->setUnit(0x2728);
     pFormat2904->setNamespace(1);
-
-    pBatteryService->start();
 
     updateBatteryMetrics();
     lastBatteryUpdateMs = millis();
