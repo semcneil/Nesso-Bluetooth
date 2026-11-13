@@ -27,6 +27,7 @@
 // Timing constants
 constexpr unsigned long BAT_NOTIFY_DELAY = 3000;
 constexpr unsigned long BTN_DEBOUNCE_MS  = 15;
+constexpr unsigned long RSSI_POLL_MS     = 1000;
 
 NessoDisplay display;
 NessoBattery battery;
@@ -41,19 +42,23 @@ NimBLECharacteristic* pBatteryVoltageChar = nullptr;
 unsigned long lastBatteryUpdateMs = 0;
 unsigned long lastKey1ChangeMs    = 0;
 unsigned long lastKey2ChangeMs    = 0;
+unsigned long lastRssiPollMs      = 0;
 uint8_t       lastKey1State       = 0;
 uint8_t       lastKey2State       = 0;
 uint8_t       receivedByte        = 0;
 
-// Cached battery telemetry for display
+// Cached telemetry for display
 uint8_t       currentBatPct       = 0;
 float         currentBatVolts     = 0.0f;
 bool          isCharging          = false;
+int8_t        currentRssi         = 0;
+uint16_t      activeConnHandle    = BLE_HS_CONN_HANDLE_NONE;
 
 // Granular UI dirty flags
 volatile bool fullRedrawDirty     = false;
 volatile bool ioDirty             = false;
 volatile bool batteryDirty        = false;
+volatile bool rssiDirty           = false;
 
 bool          isConnected         = false;
 char          peerIdStr[24]       = "None";
@@ -65,8 +70,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
         strncpy(peerIdStr, addr.c_str(), sizeof(peerIdStr) - 1);
         peerIdStr[sizeof(peerIdStr) - 1] = '\0';
 
-        // Match Central's 30ms - 45ms connection interval
-        pServer->updateConnParams(connInfo.getConnHandle(), 24, 36, 0, 200);
+        activeConnHandle = connInfo.getConnHandle();
+        pServer->updateConnParams(activeConnHandle, 24, 36, 0, 200);
 
         isConnected     = true;
         fullRedrawDirty = true;
@@ -74,8 +79,10 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
     void onDisconnect(NimBLEServer* pServer, NimBLEConnInfo& connInfo, int reason) override {
         strncpy(peerIdStr, "None", sizeof(peerIdStr));
-        isConnected     = false;
-        fullRedrawDirty = true;
+        activeConnHandle = BLE_HS_CONN_HANDLE_NONE;
+        currentRssi      = 0;
+        isConnected      = false;
+        fullRedrawDirty  = true;
         NimBLEDevice::getAdvertising()->start(0);
     }
 };
@@ -106,6 +113,23 @@ void renderBootScreen() {
     display.setTextSize(2);
     display.setCursor(20, (display.height() / 2) - 12);
     display.print("Booting...");
+}
+
+// Fast partial update for live RSSI signal readout on y = 40
+void updateRssiRegion() {
+    if (!isConnected) return;
+
+    uint16_t rssiColor = TFT_CYAN;
+    if (currentRssi < -80) {
+        rssiColor = TFT_RED;
+    } else if (currentRssi < -65) {
+        rssiColor = TFT_YELLOW;
+    }
+
+    display.setTextSize(1);
+    display.setTextColor(rssiColor, TFT_BLACK);
+    display.setCursor(166, 40);
+    display.printf("%4d dBm ", currentRssi);
 }
 
 // Fast partial update for KEY1 TX and RX 0x1237 values (< 1 ms)
@@ -148,11 +172,16 @@ void renderFullScreen() {
 
     display.setTextColor(TFT_MAGENTA, TFT_BLACK);
     display.setCursor(8, 40);
-    display.print("CLIENT:");
+    display.print("CLI:");
 
     display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setCursor(56, 40);
-    display.print(isConnected ? peerIdStr : "Waiting for central...");
+    display.setCursor(36, 40);
+    if (isConnected) {
+        display.print(peerIdStr);
+        updateRssiRegion();
+    } else {
+        display.print("Waiting for central...");
+    }
 
     display.drawFastHLine(8, 54, display.width() - 16, TFT_DARKGREY);
 
@@ -227,7 +256,7 @@ void setup() {
     battery.begin();
 
     NimBLEDevice::init("NimBLE");
-    NimBLEDevice::setPower(9); // +9 dBm TX power
+    NimBLEDevice::setPower(9);
 
     NimBLEDevice::setSecurityAuth(true, true, false);
     NimBLEDevice::setSecurityPasskey(123456);
@@ -246,7 +275,6 @@ void setup() {
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY
     );
 
-    // Include WRITE_NR so Central can send fast unacknowledged writes
     pRxDataChar = pService->createCharacteristic(
         RX_DATA_CHAR_UUID,
         NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR | NIMBLE_PROPERTY::NOTIFY
@@ -296,6 +324,7 @@ void setup() {
     fullRedrawDirty = false;
     ioDirty         = false;
     batteryDirty    = false;
+    rssiDirty       = false;
     renderFullScreen();
 }
 
@@ -326,16 +355,31 @@ void loop() {
         }
     }
 
-    // 3. Granular Display Updates
+    // 3. Poll live RSSI once per second while connected
+    if (isConnected && activeConnHandle != BLE_HS_CONN_HANDLE_NONE && (now - lastRssiPollMs) >= RSSI_POLL_MS) {
+        lastRssiPollMs = now;
+        int8_t newRssi = 0;
+        if (ble_gap_conn_rssi(activeConnHandle, &newRssi) == 0 && newRssi != currentRssi) {
+            currentRssi = newRssi;
+            rssiDirty   = true;
+        }
+    }
+
+    // 4. Granular Display Updates
     if (fullRedrawDirty) {
         fullRedrawDirty = false;
         ioDirty         = false;
         batteryDirty    = false;
+        rssiDirty       = false;
         renderFullScreen();
     } else {
         if (ioDirty) {
             ioDirty = false;
             updateIoRegion();
+        }
+        if (rssiDirty) {
+            rssiDirty = false;
+            updateRssiRegion();
         }
         if (batteryDirty) {
             batteryDirty = false;
@@ -343,7 +387,7 @@ void loop() {
         }
     }
 
-    // 4. Periodic Battery Update & Notification
+    // 5. Periodic Battery Update & Notification
     if ((now - lastBatteryUpdateMs) >= BAT_NOTIFY_DELAY) {
         lastBatteryUpdateMs = now;
         updateBatteryMetrics();

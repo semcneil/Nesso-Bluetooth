@@ -20,6 +20,7 @@
 constexpr uint32_t      SERVER_PASSKEY    = 123456;
 constexpr unsigned long BTN_DEBOUNCE_MS   = 15;
 constexpr unsigned long LOCAL_BAT_POLL_MS = 3000;
+constexpr unsigned long RSSI_POLL_MS      = 1000;
 
 NessoDisplay display;
 NessoBattery battery;
@@ -40,15 +41,18 @@ uint8_t       lastKey2State      = 0;
 unsigned long lastKey1Change     = 0;
 unsigned long lastKey2Change     = 0;
 unsigned long lastLocalBatPollMs = 0;
+unsigned long lastRssiPollMs     = 0;
 
 uint8_t       localBatPct        = 0;
 float         localBatVolts      = 0.0f;
 bool          localCharging      = false;
+int           currentRssi        = 0;
 
-// Granular UI dirty flags (avoids full-screen redraws on button presses)
+// Granular UI dirty flags
 volatile bool fullRedrawDirty    = false;
 volatile bool buttonsDirty       = false;
 volatile bool batteryDirty       = false;
+volatile bool rssiDirty          = false;
 
 uint8_t       serverBatPct       = 0;
 float         serverBatVolts     = 0.0f;
@@ -112,6 +116,7 @@ class ClientCallbacks : public NimBLEClientCallbacks {
         isScanning      = false;
         pRemoteRxChar   = nullptr;
         serverKey1State = 0;
+        currentRssi     = 0;
         strncpy(serverAddrStr, "None", sizeof(serverAddrStr));
         fullRedrawDirty = true;
     }
@@ -139,6 +144,7 @@ class ScanCallbacks : public NimBLEScanCallbacks {
                 advDevice = nullptr;
             }
             advDevice       = new NimBLEAdvertisedDevice(*advertisedDevice);
+            currentRssi     = advertisedDevice->getRSSI();
             doConnect       = true;
             fullRedrawDirty = true;
         }
@@ -160,6 +166,23 @@ void renderBootScreen() {
     display.setTextSize(2);
     display.setCursor(20, (display.height() / 2) - 12);
     display.print("Booting...");
+}
+
+// Fast partial update for live RSSI signal readout on y = 40
+void updateRssiRegion() {
+    if (!isConnected) return;
+
+    uint16_t rssiColor = TFT_GREENYELLOW;
+    if (currentRssi < -80) {
+        rssiColor = TFT_RED;
+    } else if (currentRssi < -65) {
+        rssiColor = TFT_YELLOW;
+    }
+
+    display.setTextSize(1);
+    display.setTextColor(rssiColor, TFT_BLACK);
+    display.setCursor(166, 40);
+    display.printf("%4d dBm ", currentRssi);
 }
 
 // Fast partial update for button states only (< 1 ms)
@@ -229,12 +252,13 @@ void renderFullScreen() {
     display.setTextSize(1);
     display.setTextColor(TFT_CYAN, TFT_BLACK);
     display.setCursor(8, 40);
-    display.print("SERVER:");
+    display.print("SRV:");
 
     display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setCursor(56, 40);
+    display.setCursor(36, 40);
     if (isConnected) {
         display.print(serverAddrStr);
+        updateRssiRegion();
     } else if (isScanning || doConnect) {
         display.print("Searching for server...");
     } else {
@@ -278,6 +302,7 @@ void stopAndDisconnect() {
     isConnected     = false;
     pRemoteRxChar   = nullptr;
     serverKey1State = 0;
+    currentRssi     = 0;
     strncpy(serverAddrStr, "None", sizeof(serverAddrStr));
     fullRedrawDirty = true;
 }
@@ -286,7 +311,6 @@ bool connectAndDiscover() {
     if (pClient == nullptr) {
         pClient = NimBLEDevice::createClient();
         pClient->setClientCallbacks(&clientCallbacks, false);
-        // Balanced 30ms - 45ms connection interval with 0 slave latency for snappy, reliable writes
         pClient->setConnectionParams(24, 36, 0, 200);
         pClient->setConnectTimeout(5000);
     }
@@ -294,6 +318,8 @@ bool connectAndDiscover() {
     if (!pClient->connect(advDevice)) {
         return false;
     }
+
+    currentRssi = pClient->getRssi();
 
     NimBLERemoteService* pCustomSvc = pClient->getService(CUSTOM_SERVICE_UUID);
     if (pCustomSvc) {
@@ -305,7 +331,6 @@ bool connectAndDiscover() {
 
         pRemoteRxChar = pCustomSvc->getCharacteristic(RX_DATA_CHAR_UUID);
         if (pRemoteRxChar) {
-            // Subscribe only if needed; skipping echo notify reduces RF traffic
             uint8_t initialKey1 = readKey1();
             if (pRemoteRxChar->canWriteNoResponse()) {
                 pRemoteRxChar->writeValue(&initialKey1, 1, false);
@@ -369,7 +394,7 @@ void setup() {
     lastKey2State = readKey2();
 
     NimBLEDevice::init("NimBLE-Central");
-    NimBLEDevice::setPower(9); // +9 dBm for stronger, lower-retransmit RF link
+    NimBLEDevice::setPower(9);
 
     NimBLEDevice::setSecurityAuth(true, true, false);
     NimBLEDevice::setSecurityPasskey(SERVER_PASSKEY);
@@ -378,14 +403,15 @@ void setup() {
     NimBLEScan* pScan = NimBLEDevice::getScan();
     pScan->setScanCallbacks(&scanCallbacks, false);
     pScan->setInterval(80);
-    pScan->setWindow(40); // 50% duty cycle prevents radio starvation during connect
+    pScan->setWindow(40);
     pScan->setActiveScan(true);
 
-    startScanning();
+    // startScanning();
 
     fullRedrawDirty = false;
     buttonsDirty    = false;
     batteryDirty    = false;
+    rssiDirty       = false;
     renderFullScreen();
 }
 
@@ -400,7 +426,6 @@ void loop() {
         buttonsDirty   = true;
 
         if (isConnected && pRemoteRxChar != nullptr) {
-            // Write Without Response (false) avoids blocking for an ATT ACK round-trip
             if (pRemoteRxChar->canWriteNoResponse()) {
                 pRemoteRxChar->writeValue(&lastKey1State, 1, false);
             } else {
@@ -432,16 +457,31 @@ void loop() {
         }
     }
 
-    // 4. Granular Display Updates (never blocks BLE writes)
+    // 4. Poll live RSSI once per second while connected
+    if (isConnected && pClient != nullptr && (now - lastRssiPollMs) >= RSSI_POLL_MS) {
+        lastRssiPollMs = now;
+        int newRssi = pClient->getRssi();
+        if (newRssi != 0 && newRssi != currentRssi) {
+            currentRssi = newRssi;
+            rssiDirty   = true;
+        }
+    }
+
+    // 5. Granular Display Updates
     if (fullRedrawDirty) {
         fullRedrawDirty = false;
         buttonsDirty    = false;
         batteryDirty    = false;
+        rssiDirty       = false;
         renderFullScreen();
     } else {
         if (buttonsDirty) {
             buttonsDirty = false;
             updateButtonsRegion();
+        }
+        if (rssiDirty) {
+            rssiDirty = false;
+            updateRssiRegion();
         }
         if (batteryDirty) {
             batteryDirty = false;
@@ -449,7 +489,7 @@ void loop() {
         }
     }
 
-    // 5. Periodic local battery poll
+    // 6. Periodic local battery poll
     if ((now - lastLocalBatPollMs) >= LOCAL_BAT_POLL_MS) {
         lastLocalBatPollMs = now;
         updateLocalBattery();
