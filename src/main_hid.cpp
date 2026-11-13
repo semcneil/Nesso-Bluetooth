@@ -226,7 +226,7 @@ void updateDisplay(bool connected, const char* actionMsg = "Ready") {
 void setupBleHid() {
     NimBLEDevice::init("Nesso N1 HID");
 
-    // Enable bonding & Just-Works encryption (required by OS HID drivers)
+    // Enable bonding & Just-Works encryption (required by Windows HID class driver)
     NimBLEDevice::setSecurityAuth(true, false, true);
     NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 
@@ -243,20 +243,25 @@ void setupBleHid() {
     pHid->setReportMap((uint8_t*)hidReportDescriptor, sizeof(hidReportDescriptor));
     pHid->setBatteryLevel(100);
 
-    // Start the server (automatically starts HID and Battery services in NimBLE 2.5+)
     pServer->start();
 
-    // Configure ESP32-C6 Extended Advertising (legacy-compatible PDU so all PCs see it)
+    // 1. Primary Advertisement (max 31 bytes): MUST contain Flags + HID UUID + Appearance
     NimBLEExtAdvertisement extAdv;
     extAdv.setLegacyAdvertising(true);
     extAdv.setScannable(true);
     extAdv.setConnectable(true);
-    extAdv.setName("Nesso N1 HID");
-    extAdv.setAppearance(0x03C0); // Generic HID (Keyboard + Mouse)
-    extAdv.setCompleteServices16({ pHid->getHidService()->getUUID() });
+    extAdv.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP); // 0x06: Required by Windows!
+    extAdv.setAppearance(0x03C1); // 0x03C1 = HID Keyboard (Windows recognizes 0x03C1 faster than 0x03C0)
+    extAdv.setCompleteServices16({ NimBLEUUID((uint16_t)0x1812) }); // HID Service UUID
+
+    // 2. Scan Response (max 31 bytes): Holds the full device name so primary packet isn't truncated
+    NimBLEExtAdvertisement scanResp;
+    scanResp.setLegacyAdvertising(true);
+    scanResp.setName("Nesso N1 HID");
 
     NimBLEExtAdvertising* pAdvertising = NimBLEDevice::getAdvertising();
     pAdvertising->setInstanceData(0, extAdv);
+    pAdvertising->setScanResponseData(0, scanResp);
     pAdvertising->start(0);
 }
 
