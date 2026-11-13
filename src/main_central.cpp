@@ -134,8 +134,9 @@ class ClientCallbacks : public NimBLEClientCallbacks {
 
 class ScanCallbacks : public NimBLEScanCallbacks {
     void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
-        if (advertisedDevice->getName() == TARGET_DEVICE_NAME ||
-            advertisedDevice->isAdvertisingService(NimBLEUUID(CUSTOM_SERVICE_UUID))) {
+        // if (advertisedDevice->getName() == TARGET_DEVICE_NAME ||
+        //     advertisedDevice->isAdvertisingService(NimBLEUUID(CUSTOM_SERVICE_UUID))) {
+        if (advertisedDevice->getName() == TARGET_DEVICE_NAME) {
             NimBLEDevice::getScan()->stop();
             isScanning = false;
 
