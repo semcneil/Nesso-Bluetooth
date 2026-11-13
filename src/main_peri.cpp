@@ -39,8 +39,10 @@ NimBLECharacteristic* pBatteryVoltageChar = nullptr;
 
 // State tracking
 unsigned long lastBatteryUpdateMs = 0;
-unsigned long lastButtonChangeMs  = 0;
-uint8_t       lastButtonState     = 0;
+unsigned long lastKey1ChangeMs    = 0;
+unsigned long lastKey2ChangeMs    = 0;
+uint8_t       lastKey1State       = 0;
+uint8_t       lastKey2State       = 0;
 uint8_t       receivedByte        = 0;
 
 // Cached battery telemetry for display
@@ -101,13 +103,14 @@ static RxCallbacks     rxCallbacks;
 void renderBootScreen() {
     display.fillScreen(TFT_BLACK);
 
-    display.fillRect(0, 0, display.width(), 28, TFT_NAVY);
-    display.setTextColor(TFT_WHITE, TFT_NAVY);
+    // Distinct Purple header bar for Peripheral
+    display.fillRect(0, 0, display.width(), 28, TFT_PURPLE);
+    display.setTextColor(TFT_WHITE, TFT_PURPLE);
     display.setTextSize(1);
     display.setCursor(10, 10);
-    display.print("NESSO N1 BLE SERVER");
+    display.print("NESSO N1 BLE PERIPHERAL");
 
-    display.setTextColor(TFT_YELLOW, TFT_BLACK);
+    display.setTextColor(TFT_MAGENTA, TFT_BLACK);
     display.setTextSize(2);
     display.setCursor(20, (display.height() / 2) - 12);
     display.print("Booting...");
@@ -115,72 +118,102 @@ void renderBootScreen() {
     display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     display.setTextSize(1);
     display.setCursor(20, (display.height() / 2) + 16);
-    display.print("Initializing fuel gauge & radio");
+    display.print("Initializing fuel gauge & GATT");
 }
 
 void renderStatusScreen() {
     display.fillScreen(TFT_BLACK);
 
-    // 1. Top Header Banner (Green = Connected, Orange = Ready)
-    uint16_t bannerColor = isConnected ? TFT_DARKGREEN : TFT_ORANGE;
-    uint16_t textColor   = isConnected ? TFT_WHITE : TFT_BLACK;
+    // 1. Top Header Banner (Purple = CONNECTED, Dark Cyan = READY)
+    uint16_t bannerColor = isConnected ? TFT_PURPLE : TFT_DARKCYAN;
+    uint16_t textColor   = TFT_WHITE;
 
     display.fillRect(0, 0, display.width(), 32, bannerColor);
     display.setTextColor(textColor, bannerColor);
-
     display.setTextSize(2);
     display.setCursor(8, 8);
     display.print(isConnected ? "CONNECTED" : "READY");
 
-    // Live Battery & Charging readout on the right side of the header
+    // Role & KEY2 disconnect hint on the right side of header
     display.setTextSize(1);
-    const char* chgTag = isCharging ? "CHG" : "BAT";
     display.setCursor(142, 6);
-    display.printf("%3u%% [%s]", currentBatPct, chgTag);
+    display.print("PERIPHERAL");
 
     display.setCursor(142, 18);
-    display.printf("%.2fV", currentBatVolts);
+    display.print(isConnected ? "KEY2: Disc" : "Advertising");
 
-    // 2. Peer / Client ID Section
+    // 2. Client Address / Status Line
     display.setTextSize(1);
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(8, 42);
-    display.print("CLIENT ID:");
+    display.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    display.setCursor(8, 40);
+    display.print("CLIENT:");
 
     display.setTextColor(TFT_WHITE, TFT_BLACK);
-    display.setCursor(8, 56);
-    display.print(isConnected ? peerIdStr : "Waiting for connection...");
+    display.setCursor(56, 40);
+    if (isConnected) {
+        display.print(peerIdStr);
+    } else {
+        display.print("Waiting for central...");
+    }
 
-    // Divider line
-    display.drawFastHLine(8, 74, display.width() - 16, TFT_DARKGREY);
+    display.drawFastHLine(8, 54, display.width() - 16, TFT_DARKGREY);
 
-    // 3. Receive Characteristic (0x1237) Value Section
-    display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(8, 84);
-    display.print("RECEIVE VALUE (0x1237):");
+    // 3. Two-Column Live Telemetry Section
+    // Left Column: Local KEY1 State (Sent via 0x1236)
+    display.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    display.setCursor(8, 62);
+    display.print("LOCAL KEY1 (TX)");
 
     display.setTextSize(2);
-    display.setTextColor(TFT_GREENYELLOW, TFT_BLACK);
-    display.setCursor(8, 100);
-    display.printf("0x%02X  (%u)", receivedByte, receivedByte);
+    display.setTextColor(lastKey1State ? TFT_CYAN : TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(8, 78);
+    display.print(lastKey1State ? "PRESSED" : "RELEASED");
+
+    // Vertical divider
+    display.drawFastVLine(120, 60, 48, TFT_DARKGREY);
+
+    // Right Column: Receive Data Value (Written to 0x1237)
+    display.setTextSize(1);
+    display.setTextColor(TFT_MAGENTA, TFT_BLACK);
+    display.setCursor(128, 62);
+    display.print("RX VALUE (0x1237)");
+
+    display.setTextSize(2);
+    display.setTextColor(receivedByte ? TFT_YELLOW : TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(128, 78);
+    display.printf("0x%02X (%u)", receivedByte, receivedByte);
+
+    // 4. Footer Bar with Role Badge & Peripheral's Own Battery Telemetry
+    display.drawFastHLine(8, 112, display.width() - 16, TFT_DARKGREY);
+    display.setTextSize(1);
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(8, 119);
+    const char* chgTag = isCharging ? "CHG" : "BAT";
+    display.printf("[PERIPH] BAT: %u%% (%.2fV) [%s]", currentBatPct, currentBatVolts, chgTag);
 }
 
-uint8_t readButtonState() {
-    // KEY1 is active-low on the Arduino Nesso N1
-    return (digitalRead(KEY1) == LOW) ? 1 : 0;
+// Helpers: Active-low buttons on Arduino Nesso N1 (1 = pressed, 0 = released)
+uint8_t readKey1() { return (digitalRead(KEY1) == LOW) ? 1 : 0; }
+uint8_t readKey2() { return (digitalRead(KEY2) == LOW) ? 1 : 0; }
+
+void disconnectAllClients() {
+    NimBLEServer* pServer = NimBLEDevice::getServer();
+    std::vector<uint16_t> peerHandles = pServer->getPeerDevices();
+    for (uint16_t handle : peerHandles) {
+        Serial.printf("KEY2 pressed: disconnecting client handle %u...\n", handle);
+        pServer->disconnect(handle);
+    }
 }
 
-// Encodes NessoBattery::ChargeStatus into the standard GATT 0x2A1A bitfield
 uint8_t encodeBatteryPowerState(NessoBattery::ChargeStatus status, uint8_t percentage) {
     bool charging = (status == NessoBattery::CHARGING);
 
-    uint8_t presentField     = 0x03;              // 11: Battery Present
-    uint8_t dischargingField = charging ? 0x03 : 0x02; // 11: Not Discharging, 10: Discharging
-    uint8_t chargingField    = charging ? 0x03 : 0x02; // 11: Charging, 10: Not Charging
-    uint8_t levelField       = (percentage <= 10) ? 0x03 : 0x02; // 11: Critically Low, 10: Good Level
+    uint8_t presentField     = 0x03;                              // 11: Battery Present
+    uint8_t dischargingField = charging ? 0x03 : 0x02;            // 11: Not Discharging, 10: Discharging
+    uint8_t chargingField    = charging ? 0x03 : 0x02;            // 11: Charging, 10: Not Charging
+    uint8_t levelField       = (percentage <= 10) ? 0x03 : 0x02;  // 11: Critically Low, 10: Good Level
 
-    // return (levelField << 6) | (chargingField << 4) | (dischargingField << 2) | presentField;
-    return((uint8_t)charging);
+    return (levelField << 6) | (chargingField << 4) | (dischargingField << 2) | presentField;
 }
 
 void updateBatteryMetrics() {
@@ -223,7 +256,9 @@ void setup() {
     Serial.println("Starting NimBLE Server");
 
     pinMode(KEY1, INPUT_PULLUP);
-    lastButtonState = readButtonState();
+    pinMode(KEY2, INPUT_PULLUP);
+    lastKey1State = readKey1();
+    lastKey2State = readKey2();
 
     battery.begin();
 
@@ -261,7 +296,7 @@ void setup() {
 
     pNonSecureCharacteristic->setValue("Hello Non Secure BLE");
     pSecureCharacteristic->setValue("Hello Secure BLE");
-    pButtonChar->setValue(&lastButtonState, 1);
+    pButtonChar->setValue(&lastKey1State, 1);
 
     // --- Standard Battery Service ("180F") ---
     NimBLEService* pBatteryService = pServer->createService(BATTERY_SERVICE_UUID);
@@ -315,33 +350,45 @@ void setup() {
 void loop() {
     unsigned long now = millis();
 
-    // 1. Refresh display on the main task whenever BLE state, RX value, or battery updates
+    // 1. Refresh display on the main task whenever BLE state, RX value, button, or battery updates
     if (displayDirty) {
         displayDirty = false;
         renderStatusScreen();
     }
 
-    // 2. Rapid Button Polling & Change Notification
-    uint8_t currentButtonState = readButtonState();
-    if (currentButtonState != lastButtonState && (now - lastButtonChangeMs) >= BTN_DEBOUNCE_MS) {
-        lastButtonChangeMs = now;
-        lastButtonState    = currentButtonState;
+    // 2. Rapid KEY1 Polling & Change Notification
+    uint8_t currentKey1 = readKey1();
+    if (currentKey1 != lastKey1State && (now - lastKey1ChangeMs) >= BTN_DEBOUNCE_MS) {
+        lastKey1ChangeMs = now;
+        lastKey1State    = currentKey1;
+        displayDirty     = true;
 
-        pButtonChar->setValue(&lastButtonState, 1);
+        pButtonChar->setValue(&lastKey1State, 1);
         if (NimBLEDevice::getServer()->getConnectedCount() > 0) {
             pButtonChar->notify();
         }
-        Serial.printf("KEY1 State -> %u\n", lastButtonState);
+        Serial.printf("KEY1 State -> %u\n", lastKey1State);
     }
 
-    // 3. Periodic Battery Update & Notification (every BAT_NOTIFY_DELAY ms)
+    // 3. KEY2 Press: Disconnect active BLE client(s)
+    uint8_t currentKey2 = readKey2();
+    if (currentKey2 != lastKey2State && (now - lastKey2ChangeMs) >= BTN_DEBOUNCE_MS) {
+        lastKey2ChangeMs = now;
+        lastKey2State    = currentKey2;
+
+        if (currentKey2 == 1 && isConnected) {
+            disconnectAllClients();
+        }
+    }
+
+    // 4. Periodic Battery Update & Notification (every BAT_NOTIFY_DELAY ms)
     if ((now - lastBatteryUpdateMs) >= BAT_NOTIFY_DELAY) {
         lastBatteryUpdateMs = now;
         updateBatteryMetrics();
 
         if (NimBLEDevice::getServer()->getConnectedCount() > 0) {
             pBatteryLevelChar->notify();
-            pBatteryStateChar->notify();  // need to only notify if it has changed
+            pBatteryStateChar->notify();
             pBatteryVoltageChar->notify();
         }
     }
