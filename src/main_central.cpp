@@ -16,11 +16,13 @@
 #define BATTERY_POWER_STATE_CHAR_UUID   "2A1A"
 #define BATTERY_VOLTAGE_CHAR_UUID       "2B18"
 
-// Passkey & Debounce Timing
-constexpr uint32_t      SERVER_PASSKEY  = 123456;
-constexpr unsigned long BTN_DEBOUNCE_MS = 20;
+// Passkey & Timing Constants
+constexpr uint32_t      SERVER_PASSKEY    = 123456;
+constexpr unsigned long BTN_DEBOUNCE_MS   = 20;
+constexpr unsigned long LOCAL_BAT_POLL_MS = 3000;
 
 NessoDisplay display;
+NessoBattery battery;
 
 // Client state flags
 static NimBLEAdvertisedDevice* advDevice   = nullptr;
@@ -32,19 +34,24 @@ static bool                    isScanning  = false;
 // Remote characteristic pointer for KEY1 writes
 static NimBLERemoteCharacteristic* pRemoteRxChar = nullptr;
 
-// Local button state tracking
-uint8_t       lastKey1State  = 0;
-uint8_t       lastKey2State  = 0;
-unsigned long lastKey1Change = 0;
-unsigned long lastKey2Change = 0;
+// Local button & battery state tracking
+uint8_t       lastKey1State      = 0;
+uint8_t       lastKey2State      = 0;
+unsigned long lastKey1Change     = 0;
+unsigned long lastKey2Change     = 0;
+unsigned long lastLocalBatPollMs = 0;
+
+uint8_t       localBatPct        = 0;
+float         localBatVolts      = 0.0f;
+bool          localCharging      = false;
 
 // Remote server telemetry for display (shared between BLE callbacks & loop)
-volatile bool displayDirty     = false;
-uint8_t       serverBatPct     = 0;
-float         serverBatVolts   = 0.0f;
-bool          serverCharging   = false;
-uint8_t       serverKey1State  = 0;
-char          serverAddrStr[24] = "None";
+volatile bool displayDirty       = false;
+uint8_t       serverBatPct       = 0;
+float         serverBatVolts     = 0.0f;
+bool          serverCharging     = false;
+uint8_t       serverKey1State    = 0;
+char          serverAddrStr[24]  = "None";
 
 // Forward declarations
 void renderStatusScreen();
@@ -52,6 +59,19 @@ void renderStatusScreen();
 // Helper: Reads active-low buttons on Arduino Nesso N1 (1 = pressed, 0 = released)
 uint8_t readKey1() { return (digitalRead(KEY1) == LOW) ? 1 : 0; }
 uint8_t readKey2() { return (digitalRead(KEY2) == LOW) ? 1 : 0; }
+
+void updateLocalBattery() {
+    uint16_t voltageMv = battery.getVoltage();
+    uint8_t percentage = battery.getChargeLevel();
+    auto status        = battery.getChargeStatus();
+
+    if (percentage > 100) percentage = 100;
+
+    localBatPct   = percentage;
+    localBatVolts = voltageMv / 1000.0f;
+    localCharging = (status == NessoBattery::CHARGING);
+    displayDirty  = true;
+}
 
 // Notification callback for subscribed characteristics
 void notifyCallback(NimBLERemoteCharacteristic* pRemoteCharacteristic,
@@ -162,7 +182,7 @@ void renderBootScreen() {
     display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
     display.setTextSize(1);
     display.setCursor(20, (display.height() / 2) + 16);
-    display.print("Initializing BLE scanner & UI");
+    display.print("Initializing fuel gauge & scanner");
 }
 
 void renderStatusScreen() {
@@ -192,9 +212,9 @@ void renderStatusScreen() {
     // Server Battery Telemetry on right side of header when connected
     display.setTextSize(1);
     if (isConnected) {
-        const char* chgTag = serverCharging ? "CHG" : "BAT";
+        const char* srvChgTag = serverCharging ? "CHG" : "BAT";
         display.setCursor(138, 6);
-        display.printf("SRV:%3u%%[%s]", serverBatPct, chgTag);
+        display.printf("SRV:%3u%%[%s]", serverBatPct, srvChgTag);
 
         display.setCursor(138, 18);
         display.printf("    %.2fV", serverBatVolts);
@@ -219,44 +239,46 @@ void renderStatusScreen() {
         display.print("Press KEY2 to scan");
     }
 
-    display.drawFastHLine(8, 55, display.width() - 16, TFT_DARKGREY);
+    display.drawFastHLine(8, 54, display.width() - 16, TFT_DARKGREY);
 
     // 3. Two-Column Button Status Section (Local KEY1 TX vs Remote Server KEY1 RX)
     // Left Column: Local KEY1 (Sent to 0x1237)
     display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(8, 64);
+    display.setCursor(8, 62);
     display.print("LOCAL KEY1 (TX)");
 
     display.setTextSize(2);
     display.setTextColor(lastKey1State ? TFT_GREENYELLOW : TFT_LIGHTGREY, TFT_BLACK);
-    display.setCursor(8, 80);
+    display.setCursor(8, 78);
     display.print(lastKey1State ? "PRESSED" : "RELEASED");
 
     // Vertical divider
-    display.drawFastVLine(120, 62, 62, TFT_DARKGREY);
+    display.drawFastVLine(120, 60, 48, TFT_DARKGREY);
 
     // Right Column: Server KEY1 (Received from 0x1236)
     display.setTextSize(1);
     display.setTextColor(TFT_CYAN, TFT_BLACK);
-    display.setCursor(128, 64);
+    display.setCursor(128, 62);
     display.print("SERVER KEY1 (RX)");
 
     display.setTextSize(2);
     if (!isConnected) {
         display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-        display.setCursor(128, 80);
+        display.setCursor(128, 78);
         display.print("---");
     } else {
         display.setTextColor(serverKey1State ? TFT_ORANGE : TFT_LIGHTGREY, TFT_BLACK);
-        display.setCursor(128, 80);
+        display.setCursor(128, 78);
         display.print(serverKey1State ? "PRESSED" : "RELEASED");
     }
 
-    // Footer hint
+    // 4. Footer Bar with Central's Own Battery Level & Voltage
+    display.drawFastHLine(8, 112, display.width() - 16, TFT_DARKGREY);
     display.setTextSize(1);
-    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-    display.setCursor(8, 118);
-    display.print("KEY1: Send 1/0   KEY2: Connect/Disc");
+    display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+    display.setCursor(8, 119);
+    const char* locChgTag = localCharging ? "CHG" : "BAT";
+    display.printf("LOCAL BAT: %u%% (%.2fV) [%s]", localBatPct, localBatVolts, locChgTag);
 }
 
 void startScanning() {
@@ -397,6 +419,11 @@ void setup() {
     delay(1500);
     Serial.println("Starting NimBLE Central Client...");
 
+    // Initialize local BQ27220 battery fuel gauge
+    battery.begin();
+    updateLocalBattery();
+    lastLocalBatPollMs = millis();
+
     // Initialize KEY1 and KEY2 buttons
     pinMode(KEY1, INPUT_PULLUP);
     pinMode(KEY2, INPUT_PULLUP);
@@ -433,7 +460,13 @@ void loop() {
         renderStatusScreen();
     }
 
-    // 2. Handle KEY2 Press: Toggle Scan/Connect vs. Disconnect/Idle
+    // 2. Periodically poll the central unit's own battery gauge
+    if ((now - lastLocalBatPollMs) >= LOCAL_BAT_POLL_MS) {
+        lastLocalBatPollMs = now;
+        updateLocalBattery();
+    }
+
+    // 3. Handle KEY2 Press: Toggle Scan/Connect vs. Disconnect/Idle
     uint8_t currentKey2 = readKey2();
     if (currentKey2 != lastKey2State && (now - lastKey2Change) >= BTN_DEBOUNCE_MS) {
         lastKey2Change = now;
@@ -448,7 +481,7 @@ void loop() {
         }
     }
 
-    // 3. Complete pending connection triggered by scan result
+    // 4. Complete pending connection triggered by scan result
     if (doConnect) {
         doConnect = false;
         if (connectAndDiscover()) {
@@ -459,7 +492,7 @@ void loop() {
         }
     }
 
-    // 4. Handle KEY1 State Change: Write 1 (pressed) or 0 (released) to 0x1237
+    // 5. Handle KEY1 State Change: Write 1 (pressed) or 0 (released) to 0x1237
     uint8_t currentKey1 = readKey1();
     if (currentKey1 != lastKey1State && (now - lastKey1Change) >= BTN_DEBOUNCE_MS) {
         lastKey1Change = now;
