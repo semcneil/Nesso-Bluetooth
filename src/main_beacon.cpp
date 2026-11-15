@@ -13,13 +13,14 @@
 
 // Custom 128-bit Proximity UUID
 #define BEACON_UUID "8ec76ea3-6668-48da-9866-75be8bc86f4d"
+#define BEACON_NAME "NessoBeacon3"
 
 // Beacon identifiers & timing
 #define BEACON_MAJOR 1
 #define MINOR_DEFAULT 100
 #define MINOR_PRESSED 101
 #define MEASURED_POWER -59       // Calibrated RSSI at 1 meter (in dBm)
-#define BEACON_INTERVAL 2000     // Periodic broadcast interval (ms)
+#define BEACON_INTERVAL 500     // Periodic broadcast interval (ms)
 #define ADV_BURST_MS 150         // Duration of each BLE burst & red flash (ms)
 #define BATTERY_REFRESH_MS 2000  // How often to poll the BQ27220 fuel gauge (ms)
 
@@ -152,7 +153,7 @@ void setup() {
   initScreenUI();
 
   // Initialize NimBLE
-  NimBLEDevice::init("Nesso-N1-Beacon");
+  NimBLEDevice::init(BEACON_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
   // Transmit initial beacon
