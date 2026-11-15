@@ -20,8 +20,6 @@
 #define MINOR_DEFAULT 100
 #define MINOR_PRESSED 101
 #define MEASURED_POWER -59       // Calibrated RSSI at 1 meter (in dBm)
-#define BEACON_INTERVAL 500     // Periodic broadcast interval (ms)
-#define ADV_BURST_MS 150         // Duration of each BLE burst & red flash (ms)
 #define BATTERY_REFRESH_MS 2000  // How often to poll the BQ27220 fuel gauge (ms)
 
 // Nesso N1 Display & Battery objects
@@ -29,24 +27,22 @@ NessoDisplay display;
 NessoBattery battery;
 
 static uint8_t advInstance = 0;
-unsigned long lastPeriodicBeacon = 0;
 unsigned long lastBatteryUpdate = 0;
 bool lastButtonState = HIGH;
 
-// Draws the red/dark-gray TX indicator circle and current Minor value
-void drawTxIndicator(bool transmitting, uint16_t minorValue) {
-  // Indicator circle on the right side of the header
-  if (transmitting) {
+// Updates the TX indicator circle (Red when KEY1 is pressed/301, Green when default/300)
+void updateBeaconDisplay(bool isPressed, uint16_t minorValue) {
+  if (isPressed) {
     display.fillCircle(214, 22, 12, TFT_RED);
     display.drawCircle(214, 22, 14, TFT_WHITE);
   } else {
     display.fillCircle(214, 22, 14, TFT_BLACK); // Clear outer ring
-    display.fillCircle(214, 22, 12, TFT_DARKGREY);
+    display.fillCircle(214, 22, 12, TFT_GREEN);
   }
 
   // Update Minor value display
   display.setTextSize(2);
-  display.setTextColor(transmitting ? TFT_RED : TFT_CYAN, TFT_BLACK);
+  display.setTextColor(isPressed ? TFT_RED : TFT_CYAN, TFT_BLACK);
   display.setCursor(10, 48);
   display.printf("Major:%u Minor:%u ", BEACON_MAJOR, minorValue);
 }
@@ -91,12 +87,12 @@ void initScreenUI() {
   display.drawFastHLine(0, 40, 240, TFT_DARKGREY);
   display.drawFastHLine(0, 76, 240, TFT_DARKGREY);
 
-  drawTxIndicator(false, MINOR_DEFAULT);
+  updateBeaconDisplay(false, MINOR_DEFAULT);
   updateBatteryDisplay();
 }
 
-// Builds and transmits a short legacy iBeacon burst while flashing the red indicator
-void sendBeaconBurst(uint16_t minorValue) {
+// Configures and starts continuous legacy iBeacon advertising
+void startContinuousBeacon(uint16_t minorValue, bool isPressed) {
   NimBLEExtAdvertising *pAdvertising = NimBLEDevice::getAdvertising();
 
   if (pAdvertising->isAdvertising()) {
@@ -116,9 +112,9 @@ void sendBeaconBurst(uint16_t minorValue) {
   oAdvertisementData.setScannable(false);
   oAdvertisementData.setFlags(0x06);
 
-  // Fast packet interval (~20ms) during the burst
-  oAdvertisementData.setMinInterval(32);
-  oAdvertisementData.setMaxInterval(48);
+  // Standard Apple iBeacon advertising interval: 100ms (160 * 0.625ms = 100ms)
+  oAdvertisementData.setMinInterval(160);
+  oAdvertisementData.setMaxInterval(160);
 
   NimBLEBeacon::BeaconData beaconData = oBeacon.getData();
   oAdvertisementData.setManufacturerData(
@@ -129,12 +125,8 @@ void sendBeaconBurst(uint16_t minorValue) {
   pAdvertising->setInstanceData(advInstance, oAdvertisementData);
   pAdvertising->start(advInstance);
 
-  // Flash red indicator on screen while radio is transmitting
-  drawTxIndicator(true, minorValue);
-  delay(ADV_BURST_MS);
-
-  pAdvertising->stop(advInstance);
-  drawTxIndicator(false, minorValue);
+  // Update screen status
+  updateBeaconDisplay(isPressed, minorValue);
 }
 
 void setup() {
@@ -156,31 +148,24 @@ void setup() {
   NimBLEDevice::init(BEACON_NAME);
   NimBLEDevice::setPower(ESP_PWR_LVL_P9);
 
-  // Transmit initial beacon
-  lastPeriodicBeacon = millis();
-  sendBeaconBurst(lastButtonState == LOW ? MINOR_PRESSED : MINOR_DEFAULT);
+  // Start continuous beacon broadcasting
+  bool isPressed = (lastButtonState == LOW);
+  startContinuousBeacon(isPressed ? MINOR_PRESSED : MINOR_DEFAULT, isPressed);
 }
 
 void loop() {
   unsigned long now = millis();
   bool currentButtonState = digitalRead(KEY1); // Active LOW when pressed
 
-  // 1. Immediate trigger when KEY1 is pressed (Minor = 101)
-  if (lastButtonState == HIGH && currentButtonState == LOW) {
-    sendBeaconBurst(MINOR_PRESSED);
-    lastPeriodicBeacon = millis();
+  // Update beacon payload only when KEY1 state changes (pressed or released)
+  if (currentButtonState != lastButtonState) {
+    lastButtonState = currentButtonState;
+    bool isPressed = (currentButtonState == LOW);
+    startContinuousBeacon(isPressed ? MINOR_PRESSED : MINOR_DEFAULT, isPressed);
     delay(30); // Debounce
   }
-  lastButtonState = currentButtonState;
 
-  // 2. Periodic trigger every BEACON_INTERVAL ms (Minor = 100 unless KEY1 held)
-  if (now - lastPeriodicBeacon >= BEACON_INTERVAL) {
-    lastPeriodicBeacon = now;
-    uint16_t minorToSend = (currentButtonState == LOW) ? MINOR_PRESSED : MINOR_DEFAULT;
-    sendBeaconBurst(minorToSend);
-  }
-
-  // 3. Periodically refresh battery percentage and voltage on screen
+  // Periodically refresh battery percentage and voltage on screen
   if (now - lastBatteryUpdate >= BATTERY_REFRESH_MS) {
     lastBatteryUpdate = now;
     updateBatteryDisplay();
