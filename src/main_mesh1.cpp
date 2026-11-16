@@ -6,6 +6,7 @@
 */
 
 #include "secrets.h"
+#define KEY2_PIN KEY2
 
 #include <Arduino.h>
 #include <Arduino_Nesso_N1.h>
@@ -13,11 +14,22 @@
 #include <esp_mac.h>
 
 // ==========================================
-// 0. OPTIONAL DEVICE NAME CONFIGURATION
+// 0. OPTIONAL DEVICE NAME & PIN CONFIGURATION
 // ==========================================
 // Leave as "" to flash the EXACT same code to all boards (uses unique MAC hex ID).
 // Or set up to 4 characters (e.g., "N-01", "BASE", "UNIT") before flashing each board.
 // #define NODE_CUSTOM_NAME  ""
+
+// Hardware pins for Arduino Nesso N1 (adjust if using a custom carrier revision)
+#ifndef KEY2_PIN
+  #define KEY2_PIN        0   // KEY2 button (Active LOW with internal pull-up)
+#endif
+#ifndef BUZZER_PIN
+  #define BUZZER_PIN      11  // Piezo buzzer PWM pin
+#endif
+
+#define BEEP_FREQ_HZ      750
+#define BEEP_DURATION_MS  400 // 0.4 seconds
 
 // ==========================================
 // 1. NESSO N1 DISPLAY INSTANCE
@@ -34,9 +46,13 @@ NessoDisplay display;
 #define NODE_TIMEOUT_MS   15000 // Drop node from list if silent for 15s
 #define BEACON_INTERVAL   1200  // Broadcast own presence every 1.2s
 
+#define CMD_BEACON        0x01
+#define CMD_BEEP          0x02
+
 struct __attribute__((packed)) MeshPacket {
   uint8_t  magic1;
   uint8_t  magic2;
+  uint8_t  cmd;        // CMD_BEACON (0x01) or CMD_BEEP (0x02)
   uint16_t originId;   // Unique hardware ID derived from ESP32-C6 MAC
   char     label[5];   // 4-char display name + null terminator
   uint16_t seqNum;     // Rolling packet sequence number
@@ -48,6 +64,7 @@ struct PeerNode {
   uint16_t id;
   char     label[5];
   uint16_t lastSeq;
+  uint16_t lastBeepSeq;  // Separate sequence tracker so beeps are never skipped
   bool     isDirect;
   uint8_t  hops;         // 0 = Direct, 1..4 = Relay hops away
   int8_t   rssi;
@@ -59,18 +76,42 @@ PeerNode peers[MAX_NODES];
 uint16_t myNodeId = 0;
 char     myNodeLabel[5] = {0};
 uint16_t mySeqNum = 0;
+uint16_t myBeepSeqNum = 0;
 
 // ESP32-C6 uses NimBLE Extended Advertising by default in NimBLE v2.x
 NimBLEExtAdvertising* pAdvertising = nullptr;
 NimBLEScan* pScan = nullptr;
 
-// Thread-safe relay handoff between NimBLE callback and loop()
+// Thread-safe relay & beep handoff between NimBLE callback and loop()
 volatile bool hasRelayPacket = false;
 MeshPacket relayPacket;
+volatile bool triggerBeepFlag = false;
+char lastBeepOriginLabel[5] = {0};
+uint32_t beepEndMs = 0;
+bool isBeeping = false;
+
 portMUX_TYPE meshMux = portMUX_INITIALIZER_UNLOCKED;
 
 // ==========================================
-// 3. MESH LOGIC & HOP-COUNT TRACKING
+// 3. NON-BLOCKING BUZZER HELPER
+// ==========================================
+void startBeep(const char* originLabel) {
+  strncpy(lastBeepOriginLabel, originLabel, 4);
+  lastBeepOriginLabel[4] = '\0';
+  tone(BUZZER_PIN, BEEP_FREQ_HZ);
+  beepEndMs = millis() + BEEP_DURATION_MS;
+  isBeeping = true;
+}
+
+void updateBuzzer() {
+  if (isBeeping && (int32_t)(millis() - beepEndMs) >= 0) {
+    noTone(BUZZER_PIN);
+    isBeeping = false;
+  }
+}
+
+// ==========================================
+// 4. MESH LOGIC, HOP TRACKING & COMMANDS
 // ==========================================
 void processIncomingPacket(const MeshPacket& pkt, int8_t rssi) {
   if (pkt.magic1 != MESH_MAGIC_1 || pkt.magic2 != MESH_MAGIC_2) return;
@@ -94,8 +135,51 @@ void processIncomingPacket(const MeshPacket& pkt, int8_t rssi) {
     }
   }
 
-  // Duplicate check: Ignore older or already-processed sequence numbers,
-  // EXCEPT if a shorter/direct path arrives for the same sequence number.
+  int targetIdx = (existingIdx != -1) ? existingIdx : emptyIdx;
+  if (targetIdx == -1) return; // Peer table full (15 devices)
+
+  // --- HANDLE BEEP COMMAND PACKETS ---
+  if (pkt.cmd == CMD_BEEP) {
+    if (existingIdx != -1) {
+      int16_t beepDiff = (int16_t)(pkt.seqNum - peers[existingIdx].lastBeepSeq);
+      if (beepDiff <= 0) {
+        return; // Already beeped for this alert event; don't re-trigger or re-flood
+      }
+    }
+
+    // Initialize slot if this is the very first packet heard from this node
+    if (existingIdx == -1) {
+      memset(&peers[targetIdx], 0, sizeof(PeerNode));
+      peers[targetIdx].active = true;
+      peers[targetIdx].id = pkt.originId;
+      memcpy(peers[targetIdx].label, pkt.label, 4);
+      peers[targetIdx].label[4] = '\0';
+      peers[targetIdx].isDirect = isDirectHit;
+      peers[targetIdx].hops = packetHops;
+      if (isDirectHit) peers[targetIdx].lastDirectMs = now;
+    }
+
+    peers[targetIdx].lastBeepSeq = pkt.seqNum;
+    peers[targetIdx].lastSeenMs = now;
+    peers[targetIdx].rssi = rssi;
+
+    // Flag main loop to sound the 750Hz / 0.4s beep
+    portENTER_CRITICAL(&meshMux);
+    memcpy(lastBeepOriginLabel, pkt.label, 4);
+    lastBeepOriginLabel[4] = '\0';
+    triggerBeepFlag = true;
+    if (pkt.ttl > 1) {
+      relayPacket = pkt;
+      relayPacket.ttl = pkt.ttl - 1;
+      hasRelayPacket = true;
+    }
+    portEXIT_CRITICAL(&meshMux);
+    return;
+  }
+
+  // --- HANDLE STANDARD BEACON PACKETS ---
+  if (pkt.cmd != CMD_BEACON) return;
+
   if (existingIdx != -1) {
     int16_t seqDiff = (int16_t)(pkt.seqNum - peers[existingIdx].lastSeq);
     if (seqDiff < 0) {
@@ -108,16 +192,14 @@ void processIncomingPacket(const MeshPacket& pkt, int8_t rssi) {
         peers[existingIdx].lastDirectMs = now;
         peers[existingIdx].rssi = rssi;
       } else if (!peers[existingIdx].isDirect && packetHops < peers[existingIdx].hops) {
-        // Found a shorter relay path for the same broadcast
         peers[existingIdx].hops = packetHops;
         peers[existingIdx].rssi = rssi;
       }
       return;
     }
+  } else {
+    memset(&peers[targetIdx], 0, sizeof(PeerNode));
   }
-
-  int targetIdx = (existingIdx != -1) ? existingIdx : emptyIdx;
-  if (targetIdx == -1) return; // Peer table full (15 devices)
 
   peers[targetIdx].active = true;
   peers[targetIdx].id = pkt.originId;
@@ -132,7 +214,6 @@ void processIncomingPacket(const MeshPacket& pkt, int8_t rssi) {
     peers[targetIdx].hops = 0;
     peers[targetIdx].lastDirectMs = now;
   } else {
-    // Only downgrade from Direct to Mesh if direct signal hasn't been heard in 4s
     if (now - peers[targetIdx].lastDirectMs > 4000) {
       peers[targetIdx].isDirect = false;
       peers[targetIdx].hops = packetHops;
@@ -150,7 +231,7 @@ void processIncomingPacket(const MeshPacket& pkt, int8_t rssi) {
 }
 
 // ==========================================
-// 4. NIMBLE v2.x SCAN CALLBACK
+// 5. NIMBLE v2.x SCAN CALLBACK
 // ==========================================
 class MeshScanCallbacks : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice* advertisedDevice) override {
@@ -169,21 +250,19 @@ class MeshScanCallbacks : public NimBLEScanCallbacks {
 };
 
 // ==========================================
-// 5. BROADCAST HELPER (ESP32-C6 EXTENDED ADVERTISING)
+// 6. BROADCAST HELPER (ESP32-C6 EXTENDED ADVERTISING)
 // ==========================================
 void broadcastPacket(const MeshPacket& pkt) {
   pAdvertising->stop(0);
 
-  // Use legacy-compatible 1M PHY PDU for reliable broad scanning
   NimBLEExtAdvertisement extAdv(BLE_HCI_LE_PHY_1M, BLE_HCI_LE_PHY_1M);
   extAdv.setLegacyAdvertising(true);
   extAdv.setScannable(false);
   extAdv.setConnectable(false);
-  extAdv.setMinInterval(32); // 20ms interval (in 0.625ms units)
-  extAdv.setMaxInterval(64); // 40ms interval (in 0.625ms units)
+  extAdv.setMinInterval(32); // 20ms interval
+  extAdv.setMaxInterval(64); // 40ms interval
   extAdv.setFlags(BLE_HS_ADV_F_DISC_GEN | BLE_HS_ADV_F_BREDR_UNSUP);
 
-  // Build Manufacturer Data: 2-byte Company ID (0xFFFF) + MeshPacket
   uint8_t payload[sizeof(MeshPacket) + 2];
   payload[0] = 0xFF;
   payload[1] = 0xFF;
@@ -195,7 +274,7 @@ void broadcastPacket(const MeshPacket& pkt) {
 }
 
 // ==========================================
-// 6. UI RENDERING (NESSO N1 240x135 LANDSCAPE 2-COLUMN GRID)
+// 7. UI RENDERING (NESSO N1 240x135 LANDSCAPE 2-COLUMN GRID)
 // ==========================================
 void drawUI() {
   int w = display.width();   // 240px in landscape
@@ -268,20 +347,32 @@ void drawUI() {
     }
   }
 
-  // 16th Grid Cell (Bottom-Right)
+  // 16th Grid Cell (Bottom-Right): Shows Beep Alert or KEY2 Prompt
   int lastX = colW;
   int lastY = startY + (7 * rowH);
-  display.fillRect(lastX, lastY, colW - 1, rowH - 1, TFT_BLACK);
-  display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  display.setCursor(lastX + 4, lastY + 3);
-  display.print("MAX 4 RELAY HOPS");
+  if (isBeeping) {
+    display.fillRoundRect(lastX + 2, lastY, colW - 4, rowH - 1, 2, TFT_RED);
+    display.setTextColor(TFT_WHITE, TFT_RED);
+    display.setCursor(lastX + 8, lastY + 3);
+    display.printf("BEEP FROM %-4s", lastBeepOriginLabel);
+  } else {
+    display.fillRect(lastX, lastY, colW - 1, rowH - 1, TFT_BLACK);
+    display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+    display.setCursor(lastX + 4, lastY + 3);
+    display.print("KEY2: BEEP MESH");
+  }
 }
 
 // ==========================================
-// 7. SETUP & MAIN LOOP
+// 8. SETUP & MAIN LOOP
 // ==========================================
 void setup() {
   Serial.begin(115200);
+
+  // Configure KEY2 Button & Buzzer
+  pinMode(KEY2_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
 
   // Initialize Nesso N1 Display
   display.begin();
@@ -296,7 +387,7 @@ void setup() {
   esp_read_mac(baseMac, ESP_MAC_BT);
   myNodeId = (baseMac[4] << 8) | baseMac[5];
 
-  // Configure Display Label: Use NODE_CUSTOM_NAME if set, otherwise fallback to MAC hex
+  // Configure Display Label
   if (strlen(NODE_CUSTOM_NAME) > 0) {
     strncpy(myNodeLabel, NODE_CUSTOM_NAME, 4);
     myNodeLabel[4] = '\0';
@@ -308,7 +399,7 @@ void setup() {
   NimBLEDevice::init("NessoN1");
   NimBLEDevice::setPower(9); // Max TX power (+9dBm)
 
-  // Configure Scanner (NimBLE v2.x API)
+  // Configure Scanner
   pScan = NimBLEDevice::getScan();
   pScan->setScanCallbacks(new MeshScanCallbacks(), true);
   pScan->setActiveScan(false);
@@ -325,9 +416,53 @@ void setup() {
 void loop() {
   static uint32_t lastBeaconMs = 0;
   static uint32_t lastUiMs = 0;
+  static uint32_t lastKey2Ms = 0;
+  static bool lastKey2State = HIGH;
   uint32_t now = millis();
 
-  // 1. Relay queued packets from other nodes
+  // 0. Service non-blocking buzzer timeout
+  updateBuzzer();
+
+  // 1. Check for incoming Beep command from the mesh
+  bool doBeep = false;
+  char senderName[5] = {0};
+  portENTER_CRITICAL(&meshMux);
+  if (triggerBeepFlag) {
+    triggerBeepFlag = false;
+    memcpy(senderName, lastBeepOriginLabel, 5);
+    doBeep = true;
+  }
+  portEXIT_CRITICAL(&meshMux);
+
+  if (doBeep) {
+    startBeep(senderName);
+    drawUI(); // Immediately show red "BEEP FROM XXXX" banner
+  }
+
+  // 2. Check KEY2 Button Press (debounced falling edge)
+  bool key2State = digitalRead(KEY2_PIN);
+  if (lastKey2State == HIGH && key2State == LOW && (now - lastKey2Ms > 300)) {
+    lastKey2Ms = now;
+    myBeepSeqNum++;
+
+    MeshPacket beepPkt;
+    beepPkt.magic1   = MESH_MAGIC_1;
+    beepPkt.magic2   = MESH_MAGIC_2;
+    beepPkt.cmd      = CMD_BEEP;
+    beepPkt.originId = myNodeId;
+    memcpy(beepPkt.label, myNodeLabel, sizeof(myNodeLabel));
+    beepPkt.seqNum   = myBeepSeqNum;
+    beepPkt.ttl      = INITIAL_TTL;
+
+    // Broadcast beep command twice briefly to maximize packet delivery across hops
+    broadcastPacket(beepPkt);
+    delay(45);
+    broadcastPacket(beepPkt);
+    delay(35);
+  }
+  lastKey2State = key2State;
+
+  // 3. Relay queued packets (both beacons and beep commands) from other nodes
   bool doRelay = false;
   MeshPacket pktToForward;
   portENTER_CRITICAL(&meshMux);
@@ -343,7 +478,7 @@ void loop() {
     delay(35);
   }
 
-  // 2. Broadcast own heartbeat periodically
+  // 4. Broadcast own presence heartbeat periodically
   if (now - lastBeaconMs >= BEACON_INTERVAL) {
     lastBeaconMs = now;
     mySeqNum++;
@@ -351,6 +486,7 @@ void loop() {
     MeshPacket selfPkt;
     selfPkt.magic1   = MESH_MAGIC_1;
     selfPkt.magic2   = MESH_MAGIC_2;
+    selfPkt.cmd      = CMD_BEACON;
     selfPkt.originId = myNodeId;
     memcpy(selfPkt.label, myNodeLabel, sizeof(myNodeLabel));
     selfPkt.seqNum   = mySeqNum;
@@ -359,8 +495,8 @@ void loop() {
     broadcastPacket(selfPkt);
   }
 
-  // 3. Expire stale nodes & refresh screen every 500ms
-  if (now - lastUiMs >= 500) {
+  // 5. Expire stale nodes & refresh screen every 250ms
+  if (now - lastUiMs >= 250) {
     lastUiMs = now;
     for (int i = 0; i < MAX_NODES; i++) {
       if (peers[i].active && (now - peers[i].lastSeenMs > NODE_TIMEOUT_MS)) {
